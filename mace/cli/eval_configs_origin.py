@@ -6,16 +6,6 @@
 
 import argparse
 from typing import Dict
-from tqdm import tqdm
-import sys
-import os
-from IPython import embed
-import pandas as pd
-import warnings
-
-from pymatgen.core.structure import Structure
-from pymatgen.core.lattice import Lattice
-from pymatgen.io.ase import AseAtomsAdaptor
 
 import ase.data
 import ase.io
@@ -28,17 +18,14 @@ from mace.cli.convert_e3nn_cueq import run as run_e3nn_to_cueq
 from mace.modules.utils import extract_invariant
 from mace.tools import torch_geometric, torch_tools, utils
 
-def normalize_coords(coords):
-    return np.mod(coords + 1e-9, 1.0)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    #parser.add_argument("--configs", help="path to XYZ configurations", required=True)
+    parser.add_argument("--configs", help="path to XYZ configurations", required=True)
     parser.add_argument("--model", help="path to model", required=True)
-    #parser.add_argument("--output", help="output path", required=True)
-    parser.add_argument("--split", help="train,val or test", required=True)
+    parser.add_argument("--output", help="output path", required=True)
     parser.add_argument(
         "--device",
         help="select device",
@@ -144,28 +131,6 @@ def main() -> None:
     args = parse_args()
     run(args)
 
-def build_crystal(crystal_str, niggli=True, primitive=False):
-    """Build crystal from cif string."""
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        crystal = Structure.from_str(crystal_str, fmt='cif')
-
-    if primitive:
-        crystal = crystal.get_primitive_structure()
-
-    if niggli:
-        crystal = crystal.get_reduced_structure()
-
-    canonical_crystal = Structure(
-        lattice=Lattice.from_parameters(*crystal.lattice.parameters),
-        species=crystal.species,
-        coords=crystal.frac_coords,
-        coords_are_cartesian=False,
-    )
-    # match is gaurantteed because cif only uses lattice params & frac_coords
-    if not canonical_crystal.matches(crystal):
-        print("Do notmatch")
-    return canonical_crystal
 
 def run(args: argparse.Namespace) -> None:
     torch_tools.set_default_dtype(args.default_dtype)
@@ -186,20 +151,7 @@ def run(args: argparse.Namespace) -> None:
         param.requires_grad = False
 
     # Load data and prepare input
-    csv_file = f"/aisi-nas/zhangcq/software/CrystalFlow/data/mp_20/{args.split}.csv"
-    assert os.path.exists(csv_file)
-    df = pd.read_csv(csv_file)[:64]
-    structures_list = []
-    atoms_list = []
-    for idx in tqdm(range(len(df))):
-        row = df.iloc[idx]
-        crystal_str = row['cif']
-        crystal = build_crystal(crystal_str, niggli=True, primitive=False)
-        structures_list.append(crystal)
-
-        ase_atoms = AseAtomsAdaptor().get_atoms(crystal)
-        atoms_list.append(ase_atoms)
-
+    atoms_list = ase.io.read(args.configs, index=":")
     if args.head is not None:
         for atoms in atoms_list:
             atoms.info["head"] = args.head
@@ -234,7 +186,7 @@ def run(args: argparse.Namespace) -> None:
     qs_list = []
     forces_collection = []
 
-    for batch in tqdm(data_loader):
+    for batch in data_loader:
         batch = batch.to(device)
         output = get_model_output(
             model, batch.to_dict(), args.compute_stress, args.compute_bec
@@ -373,34 +325,8 @@ def run(args: argparse.Namespace) -> None:
         if args.return_node_energies:
             atoms.arrays[args.info_prefix + "node_energies"] = node_energies[i]
 
-    # assert the order of `crystal` and `ase_atoms` are identical
-    assert len(structures_list) == len(atoms_list)
-    all_descriptors = []
-    all_coords = []
-    all_frac_coords = []
-    all_atypes = []
-    for idx in range(len(structures_list)):
-        crystal = structures_list[idx]
-        ase_atoms = atoms_list[idx]
-        natoms = len(ase_atoms)
-
-        assert np.allclose(normalize_coords(crystal.frac_coords), normalize_coords(ase_atoms.get_scaled_positions())) # frac coord
-        assert np.allclose(crystal.cart_coords, ase_atoms.__dict__["arrays"]["positions"]) # cart coord
-        assert np.allclose(np.array([ii.number for ii in crystal.species]), ase_atoms.__dict__["arrays"]["numbers"]) # atom types
-        assert np.allclose(crystal.lattice.matrix, ase_atoms.__dict__["_cellobj"].array) # cells
-
-        all_descriptors.append(ase_atoms.__dict__["arrays"]["MACE_descriptors"].tolist())
-        all_coords.append(ase_atoms.__dict__["arrays"]["positions"].reshape(1, natoms * 3).tolist())
-        all_frac_coords.append(ase_atoms.get_scaled_positions().reshape(1, natoms * 3).tolist())
-        all_atypes.append(ase_atoms.__dict__["arrays"]["numbers"].reshape(1, natoms).tolist())
-
-    model_output_name = args.model.split("/")[-1].split(".")[0]
-    df[f"{model_output_name}_rep_list"] = all_descriptors
-    df[f"check_{model_output_name}_coords_list"] = all_coords
-    df[f"check_{model_output_name}_frac_coords_list"] = all_frac_coords
-    df[f"check_{model_output_name}_atypes_list"] = all_atypes
-
-    df.to_csv(f"demo/mp20_{model_output_name}_{args.split}.csv", index=False)
+    # Write atoms to output path
+    ase.io.write(args.output, images=atoms_list, format="extxyz")
 
 
 if __name__ == "__main__":
