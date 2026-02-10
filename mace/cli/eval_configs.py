@@ -1,6 +1,7 @@
 ###########################################################################################
 # Script for evaluating configurations contained in an xyz file with a trained model
 # Authors: Ilyes Batatia, Gregor Simm
+# Modified by ZCQ
 # This program is distributed under the MIT License (see MIT.md)
 ###########################################################################################
 
@@ -188,7 +189,7 @@ def run(args: argparse.Namespace) -> None:
     # Load data and prepare input
     csv_file = f"/aisi-nas/zhangcq/software/CrystalFlow/data/mp_20/{args.split}.csv"
     assert os.path.exists(csv_file)
-    df = pd.read_csv(csv_file)[:64]
+    df = pd.read_csv(csv_file)
     structures_list = []
     atoms_list = []
     for idx in tqdm(range(len(df))):
