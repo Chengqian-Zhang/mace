@@ -165,6 +165,12 @@ class CheckpointIO:
         torch.save(obj=checkpoint, f=path)
         self.old_path = path
 
+    def save_last(self, checkpoint: Checkpoint) -> None:
+        filename = self.tag + "_last." + self._filename_extension
+        path = os.path.join(self.directory, filename)
+        os.makedirs(self.directory, exist_ok=True)
+        torch.save(obj=checkpoint, f=path)
+
     def load_latest(
         self, swa: Optional[bool] = False, device: Optional[torch.device] = None
     ) -> Optional[Tuple[Checkpoint, int]]:
@@ -199,6 +205,10 @@ class CheckpointHandler:
     ) -> None:
         checkpoint = self.builder.create_checkpoint(state)
         self.io.save(checkpoint, epochs, keep_last)
+
+    def save_last(self, state: CheckpointState) -> None:
+        checkpoint = self.builder.create_checkpoint(state)
+        self.io.save_last(checkpoint)
 
     def load_latest(
         self,

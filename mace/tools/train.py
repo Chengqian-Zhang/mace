@@ -9,7 +9,7 @@ import logging
 import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -36,6 +36,62 @@ from .utils import (
     compute_rmse,
     filter_nonzero_weight,
 )
+
+L2SPReferenceParams = List[Tuple[str, torch.nn.Parameter, torch.Tensor]]
+
+
+def build_l2sp_reference_params(
+    model: torch.nn.Module,
+    foundation_model: torch.nn.Module,
+    device: torch.device,
+) -> L2SPReferenceParams:
+    backbone = model.backbone if hasattr(model, "backbone") else model
+    foundation_backbone = (
+        foundation_model.backbone
+        if hasattr(foundation_model, "backbone")
+        else foundation_model
+    )
+    foundation_state = foundation_backbone.state_dict()
+    l2sp_reference_params: L2SPReferenceParams = []
+    skipped = 0
+
+    for name, param in backbone.named_parameters():
+        if not param.requires_grad:
+            continue
+        reference = foundation_state.get(name)
+        if reference is None or reference.shape != param.shape:
+            skipped += 1
+            continue
+        reference = reference.detach().to(device=device, dtype=param.dtype).clone()
+        l2sp_reference_params.append((name, param, reference))
+
+    if not l2sp_reference_params:
+        raise ValueError(
+            "L2-SP was requested, but no trainable backbone parameters matched the foundation model."
+        )
+
+    matched_params = sum(param.numel() for _, param, _ in l2sp_reference_params)
+    logging.info(
+        "L2-SP regularization enabled for %d trainable backbone tensors (%d parameters); skipped %d unmatched tensors",
+        len(l2sp_reference_params),
+        matched_params,
+        skipped,
+    )
+    return l2sp_reference_params
+
+
+def l2sp_penalty(
+    l2sp_reference_params: Optional[L2SPReferenceParams],
+    l2sp_delta: float,
+    reference_loss: torch.Tensor,
+) -> torch.Tensor:
+    if not l2sp_reference_params or l2sp_delta <= 0:
+        return reference_loss.new_zeros(())
+
+    penalty = reference_loss.new_zeros(())
+    for _, param, reference in l2sp_reference_params:
+        penalty = penalty + torch.sum((param - reference) ** 2)
+    return 0.5 * l2sp_delta * penalty
 
 
 @dataclasses.dataclass
@@ -144,6 +200,18 @@ def valid_err_log(
         logging.info(
             f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, RMSE_E_per_atom={error_e:8.2f} meV, RMSE_F={error_f:8.2f} meV / A, RMSE_Mu_per_atom={error_mu:8.2f} mDebye",
         )
+    elif log_errors == "PropertyRMSE":
+        error_prop = eval_metrics["rmse_property"]
+        error_prop_mae = eval_metrics["mae_property"]
+        logging.info(
+            f"{inintial_phrase}: head: {valid_loader_name}, loss={valid_loss:8.8f}, RMSE_property={error_prop:8.6f}, MAE_property={error_prop_mae:8.6f}",
+        )
+
+
+def _cyclic_iter(loader: DataLoader) -> Iterator:
+    """Yields batches from loader indefinitely, re-shuffling after each full pass."""
+    while True:
+        yield from loader
 
 
 def train(
@@ -168,10 +236,15 @@ def train(
     log_wandb: bool = False,
     distributed: bool = False,
     save_all_checkpoints: bool = False,
+    checkpoint_interval: Optional[int] = None,
     plotter: TrainingPlotter = None,
     distributed_model: Optional[DistributedDataParallel] = None,
     train_sampler: Optional[DistributedSampler] = None,
     rank: Optional[int] = 0,
+    property_loader: Optional[DataLoader] = None,
+    energy_reg_weight: float = 1.0,
+    l2sp_reference_params: Optional[L2SPReferenceParams] = None,
+    l2sp_delta: float = 0.0,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -183,14 +256,29 @@ def train(
 
     if max_grad_norm is not None:
         logging.info(f"Using gradient clipping with tolerance={max_grad_norm:.3f}")
+    if checkpoint_interval is not None:
+        if checkpoint_interval <= 0:
+            raise ValueError("checkpoint_interval must be a positive integer")
+        logging.info(
+            "Saving epoch checkpoints when epoch is a multiple of %d", checkpoint_interval
+        )
+
+    # Persistent energy iterator for multi-task training — created once so it
+    # advances across epochs and all energy batches are eventually seen.
+    energy_iter: Optional[Iterator] = (
+        _cyclic_iter(train_loader) if property_loader is not None else None
+    )
 
     logging.info("")
     logging.info("===========TRAINING===========")
     logging.info("Started training, reporting errors on validation set")
     logging.info("Loss metrics on validation set")
     epoch = start_epoch
+    last_completed_epoch = None
+    last_epoch_checkpoint_saved = None
 
     # log validation loss before _any_ training
+    valid_loss_head = np.inf  # guard: stays inf if valid_loaders is empty
     for valid_loader_name, valid_loader in valid_loaders.items():
         valid_loss_head, eval_metrics = evaluate(
             model=model,
@@ -243,9 +331,15 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            property_loader=property_loader,
+            energy_iter=energy_iter,
+            energy_reg_weight=energy_reg_weight,
+            l2sp_reference_params=l2sp_reference_params,
+            l2sp_delta=l2sp_delta,
         )
         if distributed:
             torch.distributed.barrier()
+        last_completed_epoch = epoch
 
         # Validate
         if epoch % eval_interval == 0:
@@ -295,6 +389,9 @@ def train(
                 )
             if log_wandb:
                 wandb.log(wandb_log_dict)
+            should_save_epoch_checkpoint = (
+                checkpoint_interval is None or epoch % checkpoint_interval == 0
+            )
             if rank == 0:
                 if valid_loss >= lowest_loss:
                     patience_counter += 1
@@ -310,7 +407,7 @@ def train(
                             )
                             if exit_now is not None:
                                 exit_now.fill_(1)
-                    if save_all_checkpoints:
+                    if save_all_checkpoints and should_save_epoch_checkpoint:
                         param_context = (
                             ema.average_parameters()
                             if ema is not None
@@ -322,19 +419,25 @@ def train(
                                 epochs=epoch,
                                 keep_last=True,
                             )
+                            last_epoch_checkpoint_saved = epoch
                 else:
                     lowest_loss = valid_loss
                     patience_counter = 0
-                    param_context = (
-                        ema.average_parameters() if ema is not None else nullcontext()
-                    )
-                    with param_context:
-                        checkpoint_handler.save(
-                            state=CheckpointState(model, optimizer, lr_scheduler),
-                            epochs=epoch,
-                            keep_last=keep_last,
+                    if should_save_epoch_checkpoint:
+                        param_context = (
+                            ema.average_parameters() if ema is not None else nullcontext()
                         )
-                        keep_last = False or save_all_checkpoints
+                        with param_context:
+                            checkpoint_handler.save(
+                                state=CheckpointState(model, optimizer, lr_scheduler),
+                                epochs=epoch,
+                                keep_last=keep_last or save_all_checkpoints,
+                            )
+                            last_epoch_checkpoint_saved = epoch
+                    keep_last = False or save_all_checkpoints
+                checkpoint_handler.save_last(
+                    state=CheckpointState(model, optimizer, lr_scheduler)
+                )
         if distributed:
             torch.distributed.barrier()
         if exit_now is not None:
@@ -343,6 +446,27 @@ def train(
                 break
 
         epoch += 1
+
+    if (
+        rank == 0
+        and save_all_checkpoints
+        and checkpoint_interval is not None
+        and last_completed_epoch is not None
+        and last_epoch_checkpoint_saved != last_completed_epoch
+    ):
+        logging.info(
+            "Saving final epoch checkpoint for epoch %d", last_completed_epoch
+        )
+        param_context = ema.average_parameters() if ema is not None else nullcontext()
+        with param_context:
+            checkpoint_handler.save(
+                state=CheckpointState(model, optimizer, lr_scheduler),
+                epochs=last_completed_epoch,
+                keep_last=True,
+            )
+            checkpoint_handler.save_last(
+                state=CheckpointState(model, optimizer, lr_scheduler)
+            )
 
     logging.info("Training complete")
 
@@ -361,6 +485,11 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
+    property_loader: Optional[DataLoader] = None,
+    energy_iter: Optional[Iterator] = None,
+    energy_reg_weight: float = 1.0,
+    l2sp_reference_params: Optional[L2SPReferenceParams] = None,
+    l2sp_delta: float = 0.0,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -376,11 +505,37 @@ def train_one_epoch(
             device=device,
             distributed=distributed,
             rank=rank,
+            l2sp_reference_params=l2sp_reference_params,
+            l2sp_delta=l2sp_delta,
         )
         opt_metrics["mode"] = "opt"
         opt_metrics["epoch"] = epoch
         if rank == 0:
             logger.log(opt_metrics)
+    elif property_loader is not None and energy_iter is not None:
+        # Multi-task: property loader drives the epoch; energy_iter is a persistent
+        # cyclic iterator maintained across epochs in train() so all energy batches
+        # are eventually seen and re-shuffled after each full pass.
+        for prop_batch in property_loader:
+            energy_batch = next(energy_iter)
+            _, opt_metrics = take_step_multitask(
+                model=model_to_train,
+                loss_fn=loss_fn,
+                prop_batch=prop_batch,
+                energy_batch=energy_batch,
+                energy_reg_weight=energy_reg_weight,
+                l2sp_reference_params=l2sp_reference_params,
+                l2sp_delta=l2sp_delta,
+                optimizer=optimizer,
+                ema=ema,
+                output_args=output_args,
+                max_grad_norm=max_grad_norm,
+                device=device,
+            )
+            opt_metrics["mode"] = "opt"
+            opt_metrics["epoch"] = epoch
+            if rank == 0:
+                logger.log(opt_metrics)
     else:
         for batch in data_loader:
             _, opt_metrics = take_step(
@@ -392,6 +547,8 @@ def train_one_epoch(
                 output_args=output_args,
                 max_grad_norm=max_grad_norm,
                 device=device,
+                l2sp_reference_params=l2sp_reference_params,
+                l2sp_delta=l2sp_delta,
             )
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
@@ -408,10 +565,14 @@ def take_step(
     output_args: Dict[str, bool],
     max_grad_norm: Optional[float],
     device: torch.device,
+    l2sp_reference_params: Optional[L2SPReferenceParams] = None,
+    l2sp_delta: float = 0.0,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
     batch_dict = batch.to_dict()
+
+    loss_parts = {}
 
     def closure():
         optimizer.zero_grad(set_to_none=True)
@@ -422,11 +583,15 @@ def take_step(
             compute_virials=output_args["virials"],
             compute_stress=output_args["stress"],
         )
-        loss = loss_fn(pred=output, ref=batch)
+        data_loss = loss_fn(pred=output, ref=batch)
+        penalty = l2sp_penalty(l2sp_reference_params, l2sp_delta, data_loss)
+        loss = data_loss + penalty
         loss.backward()
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
 
+        loss_parts["data_loss"] = data_loss.detach()
+        loss_parts["l2sp_loss"] = penalty.detach()
         return loss
 
     loss = closure()
@@ -439,8 +604,76 @@ def take_step(
         "loss": to_numpy(loss),
         "time": time.time() - start_time,
     }
+    if l2sp_reference_params and l2sp_delta > 0:
+        loss_dict["data_loss"] = to_numpy(loss_parts["data_loss"])
+        loss_dict["l2sp_loss"] = to_numpy(loss_parts["l2sp_loss"])
 
     return loss, loss_dict
+
+
+def take_step_multitask(
+    model: torch.nn.Module,
+    loss_fn: torch.nn.Module,
+    prop_batch: torch_geometric.batch.Batch,
+    energy_batch: torch_geometric.batch.Batch,
+    energy_reg_weight: float,
+    l2sp_reference_params: Optional[L2SPReferenceParams],
+    l2sp_delta: float,
+    optimizer: torch.optim.Optimizer,
+    ema: Optional[ExponentialMovingAverage],
+    output_args: Dict[str, bool],
+    max_grad_norm: Optional[float],
+    device: torch.device,
+) -> Tuple[float, Dict[str, Any]]:
+    """One optimizer step using a property batch (primary) and an energy batch (regularizer)."""
+    start_time = time.time()
+    prop_batch = prop_batch.to(device)
+    energy_batch = energy_batch.to(device)
+
+    optimizer.zero_grad(set_to_none=True)
+
+    # Property loss — forces not needed for property-only samples
+    prop_output = model(
+        prop_batch.to_dict(),
+        training=True,
+        compute_force=False,
+        compute_virials=False,
+        compute_stress=False,
+    )
+    prop_loss = loss_fn(pred=prop_output, ref=prop_batch)
+
+    # Energy/force regularization loss
+    energy_output = model(
+        energy_batch.to_dict(),
+        training=True,
+        compute_force=output_args["forces"],
+        compute_virials=output_args["virials"],
+        compute_stress=output_args["stress"],
+    )
+    energy_loss = loss_fn(pred=energy_output, ref=energy_batch)
+
+    data_loss = prop_loss + energy_reg_weight * energy_loss
+    penalty = l2sp_penalty(l2sp_reference_params, l2sp_delta, data_loss)
+    total_loss = data_loss + penalty
+    total_loss.backward()
+
+    if max_grad_norm is not None:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+
+    optimizer.step()
+
+    if ema is not None:
+        ema.update()
+
+    loss_dict = {
+        "loss": to_numpy(total_loss),
+        "prop_loss": to_numpy(prop_loss),
+        "energy_loss": to_numpy(energy_loss),
+        "time": time.time() - start_time,
+    }
+    if l2sp_reference_params and l2sp_delta > 0:
+        loss_dict["l2sp_loss"] = to_numpy(penalty)
+    return total_loss, loss_dict
 
 
 def take_step_lbfgs(
@@ -454,6 +687,8 @@ def take_step_lbfgs(
     device: torch.device,
     distributed: bool,
     rank: int,
+    l2sp_reference_params: Optional[L2SPReferenceParams] = None,
+    l2sp_delta: float = 0.0,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     logging.debug(
@@ -501,6 +736,11 @@ def take_step_lbfgs(
 
             batch_loss.backward()
             total_loss += batch_loss
+
+        penalty = l2sp_penalty(l2sp_reference_params, l2sp_delta, total_loss)
+        if penalty.requires_grad:
+            penalty.backward()
+            total_loss += penalty
 
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
@@ -618,6 +858,10 @@ class MACELoss(Metric):
         self.add_state(
             "delta_polarizability_per_atom", default=[], dist_reduce_fx="cat"
         )
+        self.add_state(
+            "property_computed", default=torch.tensor(0.0), dist_reduce_fx="sum"
+        )
+        self.add_state("delta_properties", default=[], dist_reduce_fx="cat")
 
     def update(self, batch, output):  # pylint: disable=arguments-differ
         loss = self.loss_fn(pred=output, ref=batch)
@@ -688,6 +932,20 @@ class MACELoss(Metric):
                 batch.polarizability_weight,
                 spread_quantity_vector=False,
             )
+        if (
+            output.get("property") is not None
+            and hasattr(batch, "property_label")
+            and batch.property_label is not None
+            and hasattr(batch, "property_weight")
+            and batch.property_weight is not None
+            and batch.property_weight.sum() > 0
+        ):
+            mask = batch.property_weight > 0  # [n_graphs]
+            if mask.any():
+                self.delta_properties.append(
+                    batch.property_label[mask] - output["property"][mask]
+                )
+                self.property_computed += mask.sum().float()
 
     def convert(self, delta: Union[torch.Tensor, List[torch.Tensor]]) -> np.ndarray:
         if isinstance(delta, list):
@@ -764,5 +1022,9 @@ class MACELoss(Metric):
                 delta_polarizability_per_atom
             )
             aux["q95_polarizability"] = compute_q95(delta_polarizability)
+        if self.property_computed:
+            delta_properties = self.convert(self.delta_properties)
+            aux["mae_property"] = compute_mae(delta_properties)
+            aux["rmse_property"] = compute_rmse(delta_properties)
 
         return aux["loss"], aux

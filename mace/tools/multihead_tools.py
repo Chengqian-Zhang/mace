@@ -44,6 +44,10 @@ class HeadConfig:
     train_loader: Optional[torch.utils.data.DataLoader] = None
     z_table: Optional[Any] = None
     atomic_energies_dict: Optional[Dict[str, float]] = None
+    task_dim: Optional[int] = None
+    property_name: Optional[str] = None
+    property_intensive: Optional[bool] = True
+    property_aggregation: Optional[str] = "default"  # "default" or "r2"
 
 
 def dict_head_to_dataclass(
@@ -75,6 +79,14 @@ def dict_head_to_dataclass(
         avg_num_neighbors=head.get("avg_num_neighbors", args.avg_num_neighbors),
         key_specification=head["key_specification"],
         keep_isolated_atoms=head.get("keep_isolated_atoms", args.keep_isolated_atoms),
+        task_dim=head.get("task_dim", getattr(args, "task_dim", None)),
+        property_name=head.get("property_name", getattr(args, "property_name", None)),
+        property_intensive=head.get(
+            "property_intensive", getattr(args, "property_intensive", True)
+        ),
+        property_aggregation=head.get(
+            "property_aggregation", getattr(args, "property_aggregation", "default")
+        ),
     )
 
 

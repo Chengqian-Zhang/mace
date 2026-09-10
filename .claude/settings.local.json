@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(python3 *)",
+      "Bash(break)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(python /tmp/claude-0/-aisi-nas-zhangcq-software-test-mace-property/9a0cda5c-f1e0-4869-b11e-24504326e10b/scratchpad/synthtest.py)"
+    ]
+  }
+}

@@ -8,6 +8,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from mace.tools import TensorDict
 from mace.tools.torch_geometric import Batch
@@ -622,4 +623,326 @@ class WeightedEnergyForcesL1L2Loss(torch.nn.Module):
         return (
             f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
             f"forces_weight={self.forces_weight:.3f})"
+        )
+
+
+# ------------------------------------------------------------------------------
+# Property Loss Functions (for multi-task learning)
+# ------------------------------------------------------------------------------
+
+
+def weighted_mean_absolute_error_property(
+    ref: Batch,
+    pred: TensorDict,
+    ddp: Optional[bool] = None,
+    property_std: Optional[torch.Tensor] = None,
+    property_intensive: bool = True,
+) -> torch.Tensor:
+    """MAE loss for per-graph property prediction (same interface as MSE variant)."""
+    configs_weight = ref.property_weight.view(-1, 1)  # [n_graphs, 1]
+    target = ref["property_label"]
+    output = pred["property"]
+    if not property_intensive:
+        natoms = (ref["ptr"][1:] - ref["ptr"][:-1]).view(-1, 1).to(output.dtype)
+        output = output / natoms
+        target = target / natoms
+    if property_std is not None:
+        output = output / property_std
+        target = target / property_std
+    raw_loss = configs_weight * torch.abs(target - output)
+    return reduce_loss(raw_loss, ddp)
+
+
+def weighted_mean_squared_error_property(
+    ref: Batch,
+    pred: TensorDict,
+    ddp: Optional[bool] = None,
+    property_std: Optional[torch.Tensor] = None,
+    property_intensive: bool = True,
+) -> torch.Tensor:
+    """MSE loss for per-graph property prediction.
+
+    ``ref.property_label``: [n_graphs, task_dim]
+    ``pred["property"]``:   [n_graphs, task_dim]
+    ``ref.property_weight``: [n_graphs] – 0 for non-property-head graphs.
+    ``property_std``: [task_dim] – when provided, both pred and target are
+        divided by std before squaring so the loss is scale-independent.
+    ``property_intensive``: when False (extensive), both pred and target are
+        additionally divided by natoms so every molecule contributes equally
+        regardless of size (matching DeePMD-kit behaviour).
+    """
+    configs_weight = ref.property_weight.view(-1, 1)  # [n_graphs, 1]
+    target = ref["property_label"]
+    output = pred["property"]
+    if not property_intensive:
+        natoms = (ref["ptr"][1:] - ref["ptr"][:-1]).view(-1, 1).to(output.dtype)
+        output = output / natoms
+        target = target / natoms
+    if property_std is not None:
+        output = output / property_std
+        target = target / property_std
+    raw_loss = configs_weight * torch.square(target - output)
+    return reduce_loss(raw_loss, ddp)
+
+
+def weighted_smooth_l1_error_property(
+    ref: Batch,
+    pred: TensorDict,
+    ddp: Optional[bool] = None,
+    property_std: Optional[torch.Tensor] = None,
+    property_intensive: bool = True,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """Smooth-L1 (Huber) loss for per-graph property prediction.
+
+    Same interface as the MSE/MAE variants. ``beta`` is the transition point
+    of ``F.smooth_l1_loss``: errors below ``beta`` are squared, errors above it
+    are linear. This makes property fitting robust to outliers.
+    """
+    configs_weight = ref.property_weight.view(-1, 1)  # [n_graphs, 1]
+    target = ref["property_label"]
+    output = pred["property"]
+    if not property_intensive:
+        natoms = (ref["ptr"][1:] - ref["ptr"][:-1]).view(-1, 1).to(output.dtype)
+        output = output / natoms
+        target = target / natoms
+    if property_std is not None:
+        output = output / property_std
+        target = target / property_std
+    raw_loss = configs_weight * F.smooth_l1_loss(
+        output, target, beta=beta, reduction="none"
+    )
+    return reduce_loss(raw_loss, ddp)
+
+
+class WeightedPropertyLoss(torch.nn.Module):
+    """Standalone MSE loss for molecular/crystal property prediction."""
+
+    def __init__(
+        self,
+        property_weight: float = 1.0,
+        property_std: Optional[torch.Tensor] = None,
+        property_intensive: bool = True,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "property_weight",
+            torch.tensor(property_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer("property_std", property_std)
+        self.property_intensive = property_intensive
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        if pred.get("property") is None:
+            return torch.tensor(0.0)
+        if not hasattr(ref, "property_label") or ref.property_label is None:
+            # Energy-only batch in multi-task mode — no property target, skip.
+            return torch.zeros(1, device=pred["property"].device).squeeze()
+        return self.property_weight * weighted_mean_squared_error_property(
+            ref, pred, ddp,
+            property_std=self.property_std,
+            property_intensive=self.property_intensive,
+        )
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(property_weight={self.property_weight:.3f})"
+
+
+class WeightedPropertyMAELoss(torch.nn.Module):
+    """Standalone MAE loss for molecular/crystal property prediction."""
+
+    def __init__(
+        self,
+        property_weight: float = 1.0,
+        property_std: Optional[torch.Tensor] = None,
+        property_intensive: bool = True,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "property_weight",
+            torch.tensor(property_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer("property_std", property_std)
+        self.property_intensive = property_intensive
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        if pred.get("property") is None:
+            return torch.tensor(0.0)
+        if not hasattr(ref, "property_label") or ref.property_label is None:
+            return torch.zeros(1, device=pred["property"].device).squeeze()
+        return self.property_weight * weighted_mean_absolute_error_property(
+            ref, pred, ddp,
+            property_std=self.property_std,
+            property_intensive=self.property_intensive,
+        )
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(property_weight={self.property_weight:.3f})"
+
+
+class WeightedPropertySmoothL1Loss(torch.nn.Module):
+    """Standalone smooth-L1 (Huber) loss for molecular/crystal property prediction."""
+
+    def __init__(
+        self,
+        property_weight: float = 1.0,
+        property_std: Optional[torch.Tensor] = None,
+        property_intensive: bool = True,
+        huber_delta: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "property_weight",
+            torch.tensor(property_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer("property_std", property_std)
+        self.property_intensive = property_intensive
+        self.huber_delta = huber_delta
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        if pred.get("property") is None:
+            return torch.tensor(0.0)
+        if not hasattr(ref, "property_label") or ref.property_label is None:
+            return torch.zeros(1, device=pred["property"].device).squeeze()
+        return self.property_weight * weighted_smooth_l1_error_property(
+            ref, pred, ddp,
+            property_std=self.property_std,
+            property_intensive=self.property_intensive,
+            beta=self.huber_delta,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"property_weight={self.property_weight:.3f}, "
+            f"huber_delta={self.huber_delta:.3f})"
+        )
+
+
+class WeightedEnergyForcesPropertyLoss(torch.nn.Module):
+    """Combined energy/forces + property prediction loss for multi-task training.
+
+    Energy/forces loss is applied to samples with ``energy_weight > 0``.
+    Property loss is applied to samples with ``property_weight > 0``.
+    Both can coexist within the same batch, enabling efficient multi-task training.
+    """
+
+    def __init__(
+        self,
+        energy_weight: float = 1.0,
+        forces_weight: float = 1.0,
+        property_weight: float = 1.0,
+        property_std: Optional[torch.Tensor] = None,
+        property_intensive: bool = True,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "energy_weight",
+            torch.tensor(energy_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "forces_weight",
+            torch.tensor(forces_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "property_weight",
+            torch.tensor(property_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer("property_std", property_std)
+        self.property_intensive = property_intensive
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        loss = torch.tensor(0.0, device=pred["energy"].device if pred.get("energy") is not None else torch.device("cpu"))
+        if pred.get("energy") is not None and ref.energy is not None:
+            loss = loss + self.energy_weight * weighted_mean_squared_error_energy(
+                ref, pred, ddp
+            )
+        if pred.get("forces") is not None and ref.forces is not None:
+            loss = loss + self.forces_weight * mean_squared_error_forces(ref, pred, ddp)
+        if pred.get("property") is not None and hasattr(ref, "property_label") and ref.property_label is not None:
+            loss = loss + self.property_weight * weighted_mean_squared_error_property(
+                ref, pred, ddp,
+                property_std=self.property_std,
+                property_intensive=self.property_intensive,
+            )
+        return loss
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"energy_weight={self.energy_weight:.3f}, "
+            f"forces_weight={self.forces_weight:.3f}, "
+            f"property_weight={self.property_weight:.3f})"
+        )
+
+
+class WeightedEnergyForcesPropertySmoothL1Loss(torch.nn.Module):
+    """Multi-task loss using smooth-L1 (Huber) for the property fitting task.
+
+    The property prediction term uses ``F.smooth_l1_loss`` (robust to outliers),
+    while the auxiliary energy/forces regularization terms keep their standard
+    MSE form. Intended for property fine-tuning where only the property head
+    benefits from the smooth-L1 behaviour.
+    """
+
+    def __init__(
+        self,
+        energy_weight: float = 1.0,
+        forces_weight: float = 1.0,
+        property_weight: float = 1.0,
+        property_std: Optional[torch.Tensor] = None,
+        property_intensive: bool = True,
+        huber_delta: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "energy_weight",
+            torch.tensor(energy_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "forces_weight",
+            torch.tensor(forces_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "property_weight",
+            torch.tensor(property_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer("property_std", property_std)
+        self.property_intensive = property_intensive
+        self.huber_delta = huber_delta
+
+    def forward(
+        self, ref: Batch, pred: TensorDict, ddp: Optional[bool] = None
+    ) -> torch.Tensor:
+        loss = torch.tensor(0.0, device=pred["energy"].device if pred.get("energy") is not None else torch.device("cpu"))
+        if pred.get("energy") is not None and ref.energy is not None:
+            loss = loss + self.energy_weight * weighted_mean_squared_error_energy(
+                ref, pred, ddp
+            )
+        if pred.get("forces") is not None and ref.forces is not None:
+            loss = loss + self.forces_weight * mean_squared_error_forces(ref, pred, ddp)
+        if pred.get("property") is not None and hasattr(ref, "property_label") and ref.property_label is not None:
+            loss = loss + self.property_weight * weighted_smooth_l1_error_property(
+                ref, pred, ddp,
+                property_std=self.property_std,
+                property_intensive=self.property_intensive,
+                beta=self.huber_delta,
+            )
+        return loss
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"energy_weight={self.energy_weight:.3f}, "
+            f"forces_weight={self.forces_weight:.3f}, "
+            f"property_weight={self.property_weight:.3f}, "
+            f"huber_delta={self.huber_delta:.3f})"
         )

@@ -14,6 +14,8 @@ def load_foundations_elements(
     use_scale=True,
     max_L=2,
     default_dtype: Optional[torch.dtype] = None,
+    reference_num_species: Optional[int] = None,
+    avg_num_neighbors: Optional[float] = None,
 ):
     """
     Load the foundations of a model into a model for fine-tuning.
@@ -31,6 +33,13 @@ def load_foundations_elements(
     indices_weights = [z_table.z_to_index(z) for z in new_z_table.zs]
     num_radial = model.radial_embedding.out_dim
     num_species = len(indices_weights)
+    # Use reference_num_species for the scaling divisor when provided.
+    # In MFT the combined z-table has more species than a single-task finetune, which
+    # would otherwise produce a smaller divisor → larger node-embedding weights →
+    # larger backbone features → higher initial RMSE with Glorot W_final.
+    # Passing the property-head species count as reference_num_species keeps the
+    # scaling consistent with single-task finetune.
+    scaling_num_species = reference_num_species if reference_num_species is not None else num_species
     max_ell = model.spherical_harmonics._lmax  # pylint: disable=protected-access
     model.node_embedding.linear.weight = torch.nn.Parameter(
         model_foundations.node_embedding.linear.weight.view(
@@ -38,7 +47,7 @@ def load_foundations_elements(
         )[indices_weights, :]
         .flatten()
         .clone()
-        / (num_species_foundations / num_species) ** 0.5
+        / (num_species_foundations / scaling_num_species) ** 0.5
     )
     if hasattr(model, "joint_embedding"):
         for (_, param_1), (_, param_2) in zip(
@@ -65,9 +74,11 @@ def load_foundations_elements(
         model.interactions[i].linear_up.weight = torch.nn.Parameter(
             model_foundations.interactions[i].linear_up.weight.clone()
         )
-        model.interactions[i].avg_num_neighbors = model_foundations.interactions[
-            i
-        ].avg_num_neighbors
+        model.interactions[i].avg_num_neighbors = (
+            avg_num_neighbors
+            if avg_num_neighbors is not None
+            else model_foundations.interactions[i].avg_num_neighbors
+        )
 
         for (_, param_1), (_, param_2) in zip(
             model.interactions[i].conv_tp_weights.named_parameters(),

@@ -5,7 +5,9 @@
 ###########################################################################################
 
 from abc import abstractmethod
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+import math
 
 import numpy as np
 import torch.nn.functional
@@ -1395,3 +1397,81 @@ class ScaleShiftBlock(torch.nn.Module):
             else f"{self.shift.item():.4f}"
         )
         return f"{self.__class__.__name__}(scale={formatted_scale}, shift={formatted_shift})"
+
+
+class _ResLinear(torch.nn.Module):
+    """One layer of the property fitting net, equivalent to DeePMD FittingNet (resnet_dt=True).
+
+    Forward: yy = tanh(W @ x + b) * idt [+ residual if dims compatible]
+    Init (matching DeePMD NativeLayer):
+      w   ~ N(0, 1/sqrt(n_in + n_out))   Glorot normal
+      b   ~ N(0, 1)                       unscaled, damped by idt at init
+      idt ~ N(0.1, 0.001)                 timestep; starts near 0.1 so residual branch
+                                          contributes ~10% at init (near-identity layer)
+    Resnet condition: out_dim == in_dim  or  out_dim == 2 * in_dim  (DeePMD convention).
+    """
+
+    def __init__(self, in_dim: int, out_dim: int) -> None:
+        super().__init__()
+        self.linear = torch.nn.Linear(in_dim, out_dim)
+        torch.nn.init.normal_(self.linear.weight, std=1.0 / math.sqrt(in_dim + out_dim))
+        torch.nn.init.normal_(self.linear.bias, mean=0.0, std=1.0)
+        self.resnet = (out_dim == in_dim) or (out_dim == 2 * in_dim)
+        if self.resnet:
+            self.idt = torch.nn.Parameter(torch.empty(out_dim))
+            torch.nn.init.normal_(self.idt, mean=0.1, std=0.001)
+        else:
+            self.idt = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        yy = torch.tanh(self.linear(x))
+        if self.idt is not None:
+            yy = yy * self.idt
+        if self.resnet:
+            if x.shape[-1] == yy.shape[-1]:
+                yy = yy + x
+            else:  # out_dim == 2 * in_dim
+                yy = yy + torch.cat([x, x], dim=-1)
+        return yy
+
+
+class PropertyReadoutBlock(torch.nn.Module):
+    """MLP readout for per-graph property prediction from scalar node features.
+
+    Architecture mirrors DeePMD FittingNet:
+    - tanh activation with resnet_dt (learnable timestep idt per layer)
+    - residual when out_dim == in_dim or out_dim == 2 * in_dim
+    - Glorot normal weight init, N(0,1) bias init for hidden layers
+    - Glorot normal weight init, zero bias for output layer
+      (zero bias = bias_atom_p, since labels are normalized to mean=0)
+    """
+
+    def __init__(
+        self,
+        node_feats_dim: int,
+        task_dim: int,
+        hidden_dims: Optional[List[int]] = None,
+        use_input_layernorm: bool = False,
+    ) -> None:
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [node_feats_dim, node_feats_dim, node_feats_dim]
+        dims = [node_feats_dim] + list(hidden_dims)
+        self.input_layernorm = (
+            torch.nn.LayerNorm(node_feats_dim) if use_input_layernorm else None
+        )
+        self.layers = torch.nn.ModuleList([
+            _ResLinear(dims[i], dims[i + 1])
+            for i in range(len(dims) - 1)
+        ])
+        self.final = torch.nn.Linear(dims[-1], task_dim)
+        # Glorot normal weight, zero bias = bias_atom_p for normalized labels.
+        torch.nn.init.normal_(self.final.weight, std=1.0 / math.sqrt(dims[-1] + task_dim))
+        torch.nn.init.zeros_(self.final.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ln = getattr(self, "input_layernorm", None)
+        h = ln(x) if ln is not None else x
+        for layer in self.layers:
+            h = layer(h)
+        return self.final(h)

@@ -6,6 +6,7 @@
 
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
+import ase.data
 import numpy as np
 import torch
 from e3nn import o3
@@ -27,6 +28,7 @@ from .blocks import (
     NonLinearDipolePolarReadoutBlock,
     NonLinearDipoleReadoutBlock,
     NonLinearReadoutBlock,
+    PropertyReadoutBlock,
     RadialEmbeddingBlock,
     ScaleShiftBlock,
 )
@@ -1429,3 +1431,292 @@ class EnergyDipolesMACE(torch.nn.Module):
             "atomic_dipoles": atomic_dipoles,
         }
         return output
+
+
+class ScaleShiftMACEProperty(torch.nn.Module):
+    """Multi-task MACE model combining energy/forces with molecular property prediction.
+
+    A wrapper around ScaleShiftMACE that adds task-specific property prediction heads.
+    The shared backbone (message-passing layers) is kept frozen or fine-tuned together
+    with new property readout heads. This enables multi-task learning where some training
+    samples contribute to energy/forces loss and others to property prediction loss.
+
+    Args:
+        backbone: Pre-trained ScaleShiftMACE model (serves as shared backbone).
+        property_head_names: Names of the property prediction heads.
+        task_dims: Mapping from head name to output dimensionality (e.g. {"prop_head": 3}).
+        property_intensive: Mapping from head name to whether the property is intensive
+            (True → mean over atoms, False → sum over atoms).
+        node_feats_scalar_dim: Number of scalar channels in the last interaction layer.
+            Obtained from the backbone as ``backbone.node_embedding.linear.irreps_out.dim``.
+        property_mlp_hidden_dim: Hidden layer width for the property MLP.
+    """
+
+    def __init__(
+        self,
+        backbone: ScaleShiftMACE,
+        property_head_names: List[str],
+        task_dims: Dict[str, int],
+        property_intensive: Dict[str, bool],
+        node_feats_scalar_dim: int,
+        node_feats_hidden_dim: int,
+        property_mlp_hidden_dim: int = 240,
+        property_mlp_num_layers: int = 3,
+        property_mean: Optional[Dict[str, torch.Tensor]] = None,
+        property_std: Optional[Dict[str, torch.Tensor]] = None,
+        property_input_layernorm: bool = False,
+        property_aggregation: Optional[Dict[str, str]] = None,
+        node_feats_vector_dim: int = 0,
+    ) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.property_head_names = property_head_names
+        self.task_dims_dict = task_dims
+        self.property_intensive = property_intensive
+        self.property_aggregation = property_aggregation or {}
+        self.node_feats_scalar_dim = node_feats_scalar_dim
+        # Atomic masses (Z-indexed, up to Z=118) for R2/mu center-of-mass computation.
+        self.register_buffer(
+            "atomic_masses",
+            torch.tensor(ase.data.atomic_masses, dtype=torch.get_default_dtype()),
+        )
+        # Full dim of each (non-last) interaction layer's output (= hidden_irreps.dim)
+        self.node_feats_hidden_dim = node_feats_hidden_dim
+        # l=1 equivariant feature dim per interaction layer (= n_l1_channels * 3)
+        self.node_feats_vector_dim = node_feats_vector_dim
+
+        # Match energy readout: use scalars from every interaction layer.
+        # With use_last_readout_only, energy uses only the last layer's scalars.
+        # num_interactions is a registered buffer (tensor), so convert to int.
+        num_interactions = int(backbone.num_interactions)
+        if backbone.use_last_readout_only:
+            property_input_dim = node_feats_scalar_dim
+        else:
+            property_input_dim = node_feats_scalar_dim * num_interactions
+
+        hidden_dims = [property_mlp_hidden_dim] * property_mlp_num_layers
+
+        self.property_readouts = torch.nn.ModuleDict(
+            {
+                head_name: PropertyReadoutBlock(
+                    node_feats_dim=property_input_dim,
+                    task_dim=task_dims[head_name],
+                    hidden_dims=hidden_dims,
+                    use_input_layernorm=property_input_layernorm,
+                )
+                for head_name in property_head_names
+            }
+        )
+
+        # Per-head label normalization: MLP predicts normalized values;
+        # forward() denormalizes back to original units.
+        for head_name in property_head_names:
+            task_dim = task_dims[head_name]
+            agg = (property_aggregation or {}).get(head_name, "default")
+            # mu aggregation outputs a scalar norm regardless of internal task_dim
+            output_dim = 1 if agg == "mu" else task_dim
+            mean = (
+                property_mean[head_name]
+                if property_mean and head_name in property_mean
+                else torch.zeros(output_dim)
+            )
+            std = (
+                property_std[head_name]
+                if property_std and head_name in property_std
+                else torch.ones(output_dim)
+            )
+            if agg == "mu":
+                # norm ≥ 0: adding mean would prevent predicting small |μ|
+                mean = torch.zeros(output_dim)
+            elif agg == "r2":
+                # R² ≥ 0; a non-zero mean shifts the normalized target to
+                # (R²−mean)/std, which becomes large-negative for OOD small
+                # molecules (e.g. −5.7 σ for CH4 when trained on large mols).
+                # That forces per-atom weights far outside the training range
+                # and destroys OOD generalization.  Use mean=0 so the model
+                # learns R² = (Σ wᵢ rᵢ²) · std directly, keeping per-atom
+                # weights in a consistent positive range across molecule sizes.
+                mean = torch.zeros(output_dim)
+                std = torch.ones(output_dim)
+            self.register_buffer(f"property_mean_{head_name}", mean)
+            self.register_buffer(f"property_std_{head_name}", std)
+
+    # ---- Expose key backbone attributes for compatibility ----
+
+    @property
+    def r_max(self) -> torch.Tensor:
+        return self.backbone.r_max
+
+    @property
+    def atomic_numbers(self) -> torch.Tensor:
+        return self.backbone.atomic_numbers
+
+    @property
+    def num_interactions(self) -> torch.Tensor:
+        return self.backbone.num_interactions
+
+    @property
+    def heads(self) -> List[str]:
+        return self.backbone.heads
+
+    @property
+    def atomic_energies_fn(self) -> torch.nn.Module:
+        return self.backbone.atomic_energies_fn
+
+    @property
+    def interactions(self) -> torch.nn.ModuleList:
+        return self.backbone.interactions
+
+    @property
+    def node_embedding(self) -> torch.nn.Module:
+        return self.backbone.node_embedding
+
+    @property
+    def products(self) -> torch.nn.ModuleList:
+        return self.backbone.products
+
+    @property
+    def readouts(self) -> torch.nn.ModuleList:
+        return self.backbone.readouts
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+        compute_virials: bool = False,
+        compute_stress: bool = False,
+        compute_displacement: bool = False,
+        compute_hessian: bool = False,
+        compute_edge_forces: bool = False,
+        compute_atomic_stresses: bool = False,
+        lammps_mliap: bool = False,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        # Run the energy backbone (also returns concatenated node features)
+        out = self.backbone(
+            data,
+            training=training,
+            compute_force=compute_force,
+            compute_virials=compute_virials,
+            compute_stress=compute_stress,
+            compute_displacement=compute_displacement,
+            compute_hessian=compute_hessian,
+            compute_edge_forces=compute_edge_forces,
+            compute_atomic_stresses=compute_atomic_stresses,
+            lammps_mliap=lammps_mliap,
+        )
+
+        # Extract l=0 scalars from every interaction layer, matching energy readout.
+        # Layout: [(full_dim) x (N-1 layers)] + [scalar_dim x (last layer)]
+        # Scalars are always the first scalar_dim features within each layer's block.
+        node_feats_out = out["node_feats"]
+        if self.backbone.use_last_readout_only:
+            node_feats_scalar = node_feats_out[..., -self.node_feats_scalar_dim:]
+        else:
+            scalar_dim = self.node_feats_scalar_dim
+            full_dim = self.node_feats_hidden_dim
+            node_feats_scalar = torch.cat(
+                [
+                    node_feats_out[..., i * full_dim : i * full_dim + scalar_dim]
+                    for i in range(int(self.backbone.num_interactions))
+                ],
+                dim=-1,
+            )
+
+        num_graphs = data["ptr"].numel() - 1
+
+        # Compute property output for each property head
+        # Returns [n_graphs, task_dim]; values are meaningful only for property-head graphs.
+        property_output: Optional[torch.Tensor] = None
+        for head_name in self.property_head_names:
+            readout = self.property_readouts[head_name]
+            atom_props = readout(node_feats_scalar)  # [n_nodes, task_dim]
+
+            mean = getattr(self, f"property_mean_{head_name}")
+            std = getattr(self, f"property_std_{head_name}")
+
+            aggregation = getattr(self, "property_aggregation", {}).get(head_name, "default")
+            if aggregation == "r2":
+                # R² = Σ_i w_i × |r_i − r_CM|²  (electronic spatial extent)
+                # w_i is learned; r_CM is the mass-weighted center of mass.
+                # node_attrs is one-hot [n_nodes, n_types]; backbone.atomic_numbers is [n_types] of Z values.
+                mass_per_type = self.atomic_masses[self.backbone.atomic_numbers]  # [n_types]
+                masses = data["node_attrs"] @ mass_per_type  # [n_nodes]
+                total_mass = scatter_sum(
+                    masses, data["batch"], dim=0, dim_size=num_graphs
+                )  # [n_graphs]
+                com = scatter_sum(
+                    masses.unsqueeze(-1) * data["positions"],
+                    data["batch"],
+                    dim=0,
+                    dim_size=num_graphs,
+                ) / total_mass.unsqueeze(-1).clamp(min=1e-8)  # [n_graphs, 3]
+                r_rel = data["positions"] - com[data["batch"]]  # [n_nodes, 3]
+                r_sq = (r_rel ** 2).sum(dim=-1, keepdim=True)  # [n_nodes, 1]
+                atom_props = atom_props * r_sq  # [n_nodes, task_dim]
+                graph_props = scatter_sum(
+                    src=atom_props,
+                    index=data["batch"],
+                    dim=0,
+                    dim_size=num_graphs,
+                )
+                graph_props = graph_props * std + mean
+            elif aggregation == "mu":
+                # DeepMD-style equivariant mu: MLP scalars contracted with l=1 node features
+                # -> per-atom 3D vectors -> scatter_sum -> norm * std (no +mean, norm >= 0)
+                # node_feats_out layout per layer: [l=0 scalars | l=1 vectors | l>=2 ...]
+                if self.backbone.use_last_readout_only or self.node_feats_vector_dim == 0:
+                    raise RuntimeError(
+                        "property_aggregation='mu' requires use_last_readout_only=False "
+                        "and l=1 irreps in hidden_irreps"
+                    )
+                scalar_dim = self.node_feats_scalar_dim
+                full_dim = self.node_feats_hidden_dim
+                vector_dim = self.node_feats_vector_dim  # n_l1 * 3 per layer
+                total_feat_dim = node_feats_out.shape[-1]
+                n_interactions = int(self.backbone.num_interactions)
+                # Layers with full hidden_irreps (have l=1); last layer may be scalar-only.
+                # n_full * full_dim + (n_interactions - n_full) * scalar_dim = total
+                n_full_layers = (total_feat_dim - n_interactions * scalar_dim) // (full_dim - scalar_dim)
+                vector_features = torch.cat(
+                    [
+                        node_feats_out[..., i * full_dim + scalar_dim : i * full_dim + scalar_dim + vector_dim]
+                        for i in range(n_full_layers)
+                    ],
+                    dim=-1,
+                )  # [n_nodes, n_full_layers * vector_dim]
+                n_nodes = atom_props.shape[0]
+                # atom_props: [n_nodes, n_full_layers * n_l1]  (task_dim = n_full_layers * n_l1)
+                # gr: [n_nodes, n_full_layers * n_l1, 3]
+                gr = vector_features.view(n_nodes, -1, 3)
+                mu_per_atom = torch.bmm(atom_props.unsqueeze(1), gr).squeeze(1)  # [n_nodes, 3]
+                mu_vec = scatter_sum(
+                    mu_per_atom, data["batch"], dim=0, dim_size=num_graphs
+                )  # [n_graphs, 3]
+                graph_props = torch.sqrt(
+                    (mu_vec ** 2).sum(dim=-1, keepdim=True) + 1e-8
+                ) * std  # [n_graphs, 1]
+            elif self.property_intensive.get(head_name, True):
+                graph_props = scatter_mean(
+                    src=atom_props,
+                    index=data["batch"],
+                    dim=0,
+                    dim_size=num_graphs,
+                )
+                graph_props = graph_props * std + mean
+            else:
+                # Denorm at atom level before summing:
+                # scatter_sum(atom * std + mean) = scatter_sum(atom)*std + N*mean = y_total
+                atom_props = atom_props * std + mean
+                graph_props = scatter_sum(
+                    src=atom_props,
+                    index=data["batch"],
+                    dim=0,
+                    dim_size=num_graphs,
+                )
+
+            if property_output is None:
+                property_output = graph_props  # [n_graphs, task_dim]
+
+        out["property"] = property_output
+        return out

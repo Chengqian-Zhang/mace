@@ -138,6 +138,7 @@ def get_dataset_from_xyz(
                 key_specification=key_specification,
                 extract_atomic_energies=False,
                 head_name=head_name,
+                no_data_ok=no_data_ok,
             )
             all_valid_configs.extend(valid_configs)
             log_dataset_contents(
@@ -166,6 +167,7 @@ def get_dataset_from_xyz(
                 key_specification=key_specification,
                 extract_atomic_energies=False,
                 head_name=head_name,
+                no_data_ok=True,
             )
             all_test_configs.extend(test_configs)
 
@@ -660,6 +662,8 @@ def get_loss_fn(
     args: argparse.Namespace,
     dipole_only: bool,
     compute_dipole: bool,
+    property_std: Optional[torch.Tensor] = None,
+    property_intensive: bool = True,
 ) -> torch.nn.Module:
     if args.loss == "weighted":
         loss_fn = modules.WeightedEnergyForcesLoss(
@@ -716,6 +720,42 @@ def get_loss_fn(
             energy_weight=args.energy_weight,
             forces_weight=args.forces_weight,
             dipole_weight=args.dipole_weight,
+        )
+    elif args.loss == "property":
+        loss_fn = modules.WeightedPropertyLoss(
+            property_weight=getattr(args, "property_weight", 1.0),
+            property_std=property_std,
+            property_intensive=property_intensive,
+        )
+    elif args.loss == "property_mae":
+        loss_fn = modules.WeightedPropertyMAELoss(
+            property_weight=getattr(args, "property_weight", 1.0),
+            property_std=property_std,
+            property_intensive=property_intensive,
+        )
+    elif args.loss == "property_huber":
+        loss_fn = modules.WeightedPropertySmoothL1Loss(
+            property_weight=getattr(args, "property_weight", 1.0),
+            property_std=property_std,
+            property_intensive=property_intensive,
+            huber_delta=args.huber_delta,
+        )
+    elif args.loss == "energy_forces_property":
+        loss_fn = modules.WeightedEnergyForcesPropertyLoss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+            property_weight=getattr(args, "property_weight", 1.0),
+            property_std=property_std,
+            property_intensive=property_intensive,
+        )
+    elif args.loss == "energy_forces_property_huber":
+        loss_fn = modules.WeightedEnergyForcesPropertySmoothL1Loss(
+            energy_weight=args.energy_weight,
+            forces_weight=args.forces_weight,
+            property_weight=getattr(args, "property_weight", 1.0),
+            property_std=property_std,
+            property_intensive=property_intensive,
+            huber_delta=args.huber_delta,
         )
     else:
         loss_fn = modules.WeightedEnergyForcesLoss(energy_weight=1.0, forces_weight=1.0)
@@ -813,6 +853,47 @@ def freeze_module(module: torch.nn.Module, freeze: bool = True):
         p.requires_grad = not freeze
 
 
+def _resolve_surgical_layer(layer: int, num_layers: int) -> int:
+    if layer < 0:
+        layer += num_layers
+    if layer < 0 or layer >= num_layers:
+        raise ValueError(
+            f"--surgical_ft_layer must be in [0, {num_layers - 1}] "
+            f"or a valid negative index; got {layer}"
+        )
+    return layer
+
+
+def apply_surgical_ft(model: torch.nn.Module, layer: int) -> None:
+    if not hasattr(model, "backbone"):
+        raise ValueError("--surgical_ft_layer requires a model with a backbone")
+
+    backbone = model.backbone
+    num_layers = len(backbone.interactions)
+    layer = _resolve_surgical_layer(layer, num_layers)
+
+    freeze_module(backbone, True)
+    freeze_module(backbone.interactions[layer], False)
+    freeze_module(backbone.products[layer], False)
+
+    unfrozen = [f"backbone.interactions.{layer}", f"backbone.products.{layer}"]
+    if len(backbone.readouts) == num_layers:
+        freeze_module(backbone.readouts[layer], False)
+        unfrozen.append(f"backbone.readouts.{layer}")
+    elif layer == num_layers - 1 and len(backbone.readouts) == 1:
+        freeze_module(backbone.readouts[0], False)
+        unfrozen.append("backbone.readouts.0")
+
+    trainable_backbone_params = sum(
+        p.numel() for p in backbone.parameters() if p.requires_grad
+    )
+    logging.info(
+        "Surgical-FT enabled: frozen backbone except %s (%d trainable backbone parameters)",
+        ", ".join(unfrozen),
+        trainable_backbone_params,
+    )
+
+
 def get_params_options(
     args: argparse.Namespace, model: torch.nn.Module
 ) -> Dict[str, Any]:
@@ -825,6 +906,21 @@ def get_params_options(
             no_decay_interactions[name] = param
 
     lr_params_factors = json.loads(args.lr_params_factors)
+
+    surgical_ft_layer = getattr(args, "surgical_ft_layer", None)
+    if surgical_ft_layer is not None:
+        if getattr(args, "freeze_backbone", False):
+            raise ValueError("--surgical_ft_layer cannot be combined with --freeze_backbone")
+        if getattr(args, "freeze", None):
+            raise ValueError("--surgical_ft_layer cannot be combined with --freeze")
+        apply_surgical_ft(model, surgical_ft_layer)
+    elif getattr(args, "freeze_backbone", False) and hasattr(model, "backbone"):
+        logging.info("Freezing backbone — only property_readouts will be trained")
+        freeze_module(model.backbone, True)
+        lr_params_factors["embedding_lr_factor"] = 0.0
+        lr_params_factors["interactions_lr_factor"] = 0.0
+        lr_params_factors["products_lr_factor"] = 0.0
+        lr_params_factors["readouts_lr_factor"] = 0.0
 
     if args.freeze:
         if args.freeze >= 7:
@@ -881,6 +977,15 @@ def get_params_options(
         amsgrad=args.amsgrad,
         betas=(args.beta, 0.999),
     )
+    if hasattr(model, "property_readouts") and model.property_readouts is not None:
+        param_options["params"].append(
+            {
+                "name": "property_readouts",
+                "params": model.property_readouts.parameters(),
+                "weight_decay": 0.0,
+                "lr": args.lr,
+            }
+        )
     if hasattr(model, "joint_embedding") and model.joint_embedding is not None:
         param_options["params"].append(
             {
@@ -992,8 +1097,22 @@ class LRScheduler:
             args.optimizer
         )  # Schedulefree does not need an optimizer but checkpoint handler does.
         if args.scheduler == "ExponentialLR":
+            if args.lr_scheduler_gamma is not None:
+                gamma = args.lr_scheduler_gamma
+            elif args.lr_scheduler_min_lr is not None:
+                gamma = (args.lr_scheduler_min_lr / args.lr) ** (
+                    1.0 / args.max_num_epochs
+                )
+                logging.info(
+                    f"ExponentialLR gamma auto-computed as {gamma:.6f} "
+                    f"(lr={args.lr}, min_lr={args.lr_scheduler_min_lr}, max_num_epochs={args.max_num_epochs})"
+                )
+            else:
+                raise RuntimeError(
+                    "ExponentialLR requires either --lr_scheduler_gamma or --lr_scheduler_min_lr"
+                )
             self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-                optimizer=optimizer, gamma=args.lr_scheduler_gamma
+                optimizer=optimizer, gamma=gamma
             )
         elif args.scheduler == "ReduceLROnPlateau":
             self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

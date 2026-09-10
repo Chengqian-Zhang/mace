@@ -54,6 +54,8 @@ class AtomicData(torch_geometric.data.Data):
     volume: torch.Tensor
     fermi_level: torch.Tensor
     external_field: torch.Tensor
+    property_label: torch.Tensor
+    property_weight: torch.Tensor
 
     def __init__(
         self,
@@ -212,7 +214,10 @@ class AtomicData(torch_geometric.data.Data):
                 config.property_weights.get("energy"), dtype=torch.get_default_dtype()
             )
             if config.property_weights.get("energy") is not None
-            else torch.tensor(1.0, dtype=torch.get_default_dtype())
+            else torch.tensor(
+                0.0 if config.properties.get("energy") is None else 1.0,
+                dtype=torch.get_default_dtype(),
+            )
         )
 
         forces_weight = (
@@ -396,6 +401,25 @@ class AtomicData(torch_geometric.data.Data):
             else torch.zeros(num_atoms, 1, dtype=torch.get_default_dtype())
         )
 
+        # property_label: stored as [1, task_dim] for correct per-graph batching
+        property_label_raw = config.properties.get("property_label")
+        if property_label_raw is not None:
+            pl = torch.as_tensor(property_label_raw, dtype=torch.get_default_dtype())
+            if pl.dim() == 0:
+                pl = pl.unsqueeze(0).unsqueeze(0)  # scalar → [1, 1]
+            elif pl.dim() == 1:
+                pl = pl.unsqueeze(0)  # [task_dim] → [1, task_dim]
+            property_label = pl
+        else:
+            property_label = None
+
+        # property_weight: 1.0 if property_label present (unless overridden), else 0.0
+        _default_pw = 1.0 if property_label is not None else 0.0
+        property_weight = torch.tensor(
+            config.property_weights.get("property_label", _default_pw),
+            dtype=torch.get_default_dtype(),
+        )
+
         cls_kwargs = dict(
             edge_index=torch.tensor(edge_index, dtype=torch.long),
             positions=positions,
@@ -428,6 +452,8 @@ class AtomicData(torch_geometric.data.Data):
             volume=volume,
             fermi_level=fermi_level,
             external_field=external_field,
+            property_label=property_label,
+            property_weight=property_weight,
         )
 
         # Pass through any extra properties not already handled above.

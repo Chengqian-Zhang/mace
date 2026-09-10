@@ -71,6 +71,10 @@ def update_keyspec_from_kwargs(
         if key in keydict:
             arrays_keys[key[:-4]] = keydict[key]
 
+    # property_key → "property_label" in info_keys (per-graph scalar/vector stored in atoms.info)
+    if "property_key" in keydict:
+        info_keys["property_label"] = keydict["property_key"]
+
     # automagically add properties for embeddings
     if keydict.get("embedding_specs") is not None:
         for embed_name, embed_spec in keydict["embedding_specs"].items():

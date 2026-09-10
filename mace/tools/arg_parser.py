@@ -125,6 +125,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "DipoleMAE",
             "DipolePolarRMSE",
             "EnergyDipoleRMSE",
+            "PropertyRMSE",
         ],
         default="PerAtomRMSE",
     )
@@ -138,6 +139,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "BOTNet",
             "MACE",
             "ScaleShiftMACE",
+            "ScaleShiftMACEProperty",
             "PolarMACE",
             "MACELES",
             "ScaleShiftBOTNet",
@@ -752,6 +754,18 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="pt_head",
     )
+    parser.add_argument(
+        "--skip_train_eval",
+        help="Skip computing metrics on the training set during final evaluation",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--skip_valid_eval",
+        help="Skip computing metrics on the validation set during final evaluation",
+        action="store_true",
+        default=False,
+    )
 
     # Loss and optimization
     parser.add_argument(
@@ -770,6 +784,11 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "universal",
             "energy_forces_dipole",
             "l1l2energyforces",
+            "property",
+            "property_mae",
+            "property_huber",
+            "energy_forces_property",
+            "energy_forces_property_huber",
         ],
     )
     parser.add_argument(
@@ -841,6 +860,61 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
     )
+    # Property prediction (multi-task)
+    parser.add_argument(
+        "--property_weight",
+        help="weight of property prediction loss",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--task_dim",
+        help="dimensionality of the property output vector",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--property_name",
+        help="key name for property labels in atoms.info (e.g. 'band_gap')",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--property_intensive",
+        help="whether the property is intensive (mean pooling) or extensive (sum pooling)",
+        type=str2bool,
+        default=True,
+    )
+    parser.add_argument(
+        "--property_mlp_hidden_dim",
+        help="hidden dimension of each hidden layer in the property readout MLP",
+        type=int,
+        default=240,
+    )
+    parser.add_argument(
+        "--property_mlp_num_layers",
+        help="number of hidden layers in the property readout MLP (default: 3)",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--property_input_layernorm",
+        help="apply LayerNorm to node features before the property readout MLP (helps stabilize scratch training)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--energy_reg_weight",
+        help="weight for the energy/force regularization loss in multi-task property fine-tuning (default: 1.0)",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--energy_batch_size",
+        help="batch size for the energy regularizer loader in multi-task property fine-tuning; defaults to --batch_size",
+        type=int,
+        default=None,
+    )
     parser.add_argument(
         "--config_type_weights",
         help="String of dictionary containing the weights for each config type",
@@ -897,6 +971,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         "--weight_decay", help="weight decay (L2 penalty)", type=float, default=5e-7
     )
     parser.add_argument(
+        "--l2sp_delta",
+        help="L2-SP coefficient for penalizing trainable backbone parameters away from the foundation model; 0 disables L2-SP",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
         "--lr_params_factors",
         help="Learning rate factors to multiply on the original lr",
         type=str,
@@ -905,6 +985,18 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--freeze",
         help="Freeze layers from 1 to N. Can be positive or negative, e.g. -1 means the last layer is frozen. 0 or None means all layers are active and is a default setting",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--freeze_backbone",
+        help="Freeze the entire backbone (descriptor) and train only the property readout heads. Only applies to ScaleShiftMACEProperty.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--surgical_ft_layer",
+        help="Surgical-FT: freeze the backbone except one interaction layer index (0-based; negative indices allowed). Property readouts remain trainable.",
         type=int,
         default=None,
     )
@@ -925,9 +1017,15 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lr_scheduler_gamma",
-        help="Gamma of learning rate scheduler",
+        help="Gamma of learning rate scheduler. If not set and --lr_scheduler_min_lr is provided, gamma is computed automatically.",
         type=float,
-        default=0.9993,
+        default=None,
+    )
+    parser.add_argument(
+        "--lr_scheduler_min_lr",
+        help="Minimum learning rate for ExponentialLR. Used to auto-compute gamma as (min_lr / lr)^(1 / max_num_epochs).",
+        type=float,
+        default=None,
     )
     parser.add_argument(
         "--swa",
@@ -992,6 +1090,12 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--eval_interval", help="evaluate model every <n> epochs", type=int, default=1
+    )
+    parser.add_argument(
+        "--checkpoint_interval",
+        help="save epoch checkpoints only when epoch is a multiple of <n>; defaults to every evaluation",
+        type=int,
+        default=None,
     )
     parser.add_argument(
         "--keep_checkpoints",

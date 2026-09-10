@@ -21,6 +21,9 @@ def configure_model(
     heads=None,
     z_table=None,
     head_configs=None,
+    property_head_configs=None,
+    property_mean=None,
+    property_std=None,
 ):
     # Selecting outputs
     compute_virials = args.loss == "virials"
@@ -87,6 +90,7 @@ def configure_model(
     if model_foundation is not None and args.model in [
         "MACE",
         "ScaleShiftMACE",
+        "ScaleShiftMACEProperty",
         "MACELES",
         "PolarMACE",
     ]:
@@ -124,7 +128,10 @@ def configure_model(
         else:
             model_config_foundation["atomic_inter_shift"] = [0.0] * len(heads)
         model_config_foundation["atomic_inter_scale"] = [1.0] * len(heads)
-        args.avg_num_neighbors = model_config_foundation["avg_num_neighbors"]
+        if getattr(args, "avg_num_neighbors", None) is not None:
+            model_config_foundation["avg_num_neighbors"] = args.avg_num_neighbors
+        else:
+            args.avg_num_neighbors = model_config_foundation["avg_num_neighbors"]
         if args.model == "MACELES":
             args.model = "FoundationMACELES"
         elif args.model in ("MACE", "ScaleShiftMACE"):
@@ -202,17 +209,42 @@ def configure_model(
         )
         model_config_foundation = None
 
-    model = _build_model(args, model_config, model_config_foundation, heads)
+    model = _build_model(
+        args,
+        model_config,
+        model_config_foundation,
+        heads,
+        property_head_configs=property_head_configs,
+        property_mean=property_mean,
+        property_std=property_std,
+        property_head_seed=getattr(args, "seed", None),
+    )
 
     if model_foundation is not None:
-        model = load_foundations_elements(
-            model,
+        target = model.backbone if hasattr(model, "backbone") else model
+        # In MFT, z_table is the union of all head species (property + energy), so
+        # len(z_table) > len(property_head z_table). Use only property-head species
+        # for the node-embedding scaling divisor to match single-task finetune scale.
+        reference_num_species = None
+        if property_head_configs:
+            prop_zs: set = set()
+            for hc in property_head_configs:
+                prop_zs.update(hc.atomic_numbers)
+            reference_num_species = len(prop_zs)
+        loaded = load_foundations_elements(
+            target,
             model_foundation,
             z_table,
             load_readout=args.foundation_filter_elements,
             max_L=args.max_L,
             default_dtype=dtype_dict.get(args.default_dtype, torch.float64),
+            reference_num_species=reference_num_species,
+            avg_num_neighbors=args.avg_num_neighbors,
         )
+        if hasattr(model, "backbone"):
+            model.backbone = loaded
+        else:
+            model = loaded
 
     return model, output_args
 
@@ -245,7 +277,8 @@ def _parse_literal_or_none(value):
 
 
 def _build_model(
-    args, model_config, model_config_foundation, heads
+    args, model_config, model_config_foundation, heads, property_head_configs=None,
+    property_mean=None, property_std=None, property_head_seed=None,
 ):  # pylint: disable=too-many-return-statements
     if args.model == "MACE":
         if args.interaction_first not in [
@@ -331,6 +364,105 @@ def _build_model(
             field_norm_factor=args.field_norm_factor,
             fixedpoint_update_config=fixedpoint_update_config,
             field_readout_config=field_readout_config,
+        )
+    if args.model == "ScaleShiftMACEProperty":
+        # Build backbone as ScaleShiftMACE, then wrap with property readout heads.
+        # model_config_foundation is set when --foundation_model is provided;
+        # otherwise fall back to model_config (built from --hidden_irreps etc).
+        if model_config_foundation is not None:
+            backbone = modules.ScaleShiftMACE(**model_config_foundation)
+        else:
+            backbone = modules.ScaleShiftMACE(
+                **model_config,
+                pair_repulsion=args.pair_repulsion,
+                distance_transform=args.distance_transform,
+                correlation=args.correlation,
+                gate=modules.gate_dict[args.gate],
+                interaction_cls_first=modules.interaction_classes[args.interaction_first],
+                MLP_irreps=o3.Irreps(args.MLP_irreps),
+                atomic_inter_scale=args.std,
+                atomic_inter_shift=args.mean,
+                radial_MLP=ast.literal_eval(args.radial_MLP),
+                radial_type=args.radial_type,
+                heads=heads,
+                embedding_specs=args.embedding_specs,
+                use_embedding_readout=args.use_embedding_readout,
+                use_last_readout_only=args.use_last_readout_only,
+                use_agnostic_product=args.use_agnostic_product,
+            )
+
+        # hidden_irreps determines the per-layer feature dim and scalar count
+        raw_irreps = (
+            model_config_foundation.get("hidden_irreps", args.hidden_irreps)
+            if model_config_foundation is not None
+            else model_config.get("hidden_irreps", args.hidden_irreps)
+        )
+        hidden_irreps = o3.Irreps(str(raw_irreps))
+        node_feats_scalar_dim = hidden_irreps.count(o3.Irrep(0, 1))
+        node_feats_hidden_dim = hidden_irreps.dim
+        # l=1 equivariant features per layer (used for mu aggregation)
+        n_l1 = sum(mul for mul, ir in hidden_irreps if ir.l == 1)
+        node_feats_vector_dim = n_l1 * 3  # 3 spatial components per l=1 channel
+
+        # Collect property head info from head_configs or args
+        if property_head_configs:
+            prop_head_names = [hc.head_name for hc in property_head_configs]
+            task_dims = {hc.head_name: hc.task_dim for hc in property_head_configs}
+            prop_intensive = {
+                hc.head_name: (True if hc.property_intensive is None else hc.property_intensive)
+                for hc in property_head_configs
+            }
+            prop_aggregation = {
+                hc.head_name: (hc.property_aggregation or "default")
+                for hc in property_head_configs
+            }
+        else:
+            prop_name = getattr(args, "property_name", None) or "property_head"
+            prop_head_names = [prop_name]
+            task_dims = {prop_name: getattr(args, "task_dim", 1) or 1}
+            prop_intensive = {prop_name: getattr(args, "property_intensive", True)}
+            prop_aggregation = {prop_name: getattr(args, "property_aggregation", "default")}
+
+        # For mu aggregation: task_dim = n_l1 * n_full_layers (auto-set, not user-specified).
+        # n_full_layers = layers with full hidden_irreps (have l=1 features).
+        # ScaleShiftMACE: last layer uses hidden_irreps[0] (l=0 only) unless keep_last_layer_irreps.
+        # For n_interactions==1 the single layer also gets l=0-only treatment → n_full_layers=0.
+        # Assumes hidden_irreps lists 0e before 1o (standard MACE), so l=1 offset = scalar_dim.
+        if n_l1 > 0:
+            n_interactions = int(backbone.num_interactions)
+            keep_last = False
+            if model_config_foundation is not None:
+                keep_last = model_config_foundation.get("keep_last_layer_irreps", False)
+            else:
+                keep_last = model_config.get("keep_last_layer_irreps", False)
+            n_full_layers = n_interactions if keep_last else n_interactions - 1
+            for head_name in prop_head_names:
+                if prop_aggregation.get(head_name, "default") == "mu":
+                    if n_full_layers <= 0:
+                        raise ValueError(
+                            f"property_aggregation='mu' requires num_interactions >= 2 "
+                            f"(got {n_interactions}). Use at least 2 interaction layers."
+                        )
+                    task_dims[head_name] = n_l1 * n_full_layers
+
+        # Decouple property head init from backbone structure (finetuning vs MFT differ
+        # in number of energy readout heads → different RNG state at this point).
+        if property_head_seed is not None:
+            torch.manual_seed(property_head_seed)
+        return modules.ScaleShiftMACEProperty(
+            backbone=backbone,
+            property_head_names=prop_head_names,
+            task_dims=task_dims,
+            property_intensive=prop_intensive,
+            node_feats_scalar_dim=node_feats_scalar_dim,
+            node_feats_hidden_dim=node_feats_hidden_dim,
+            property_mlp_hidden_dim=getattr(args, "property_mlp_hidden_dim", 240),
+            property_mlp_num_layers=getattr(args, "property_mlp_num_layers", 3),
+            property_mean=property_mean,
+            property_std=property_std,
+            property_input_layernorm=getattr(args, "property_input_layernorm", False),
+            property_aggregation=prop_aggregation,
+            node_feats_vector_dim=node_feats_vector_dim,
         )
     if args.model == "FoundationMACE":
         return modules.ScaleShiftMACE(**model_config_foundation)

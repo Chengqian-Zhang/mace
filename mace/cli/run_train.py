@@ -36,6 +36,7 @@ from mace.cli.convert_e3nn_oeq import run as run_e3nn_to_oeq
 from mace.cli.convert_oeq_e3nn import run as run_oeq_to_e3nn
 from mace.cli.visualise_train import TrainingPlotter
 from mace.data import KeySpecification, update_keyspec_from_kwargs
+from mace.modules import compute_avg_num_neighbors
 from mace.modules.lora import inject_LoRAs, merge_lora_weights
 from mace.tools import torch_geometric
 from mace.tools.distributed_tools import init_distributed
@@ -227,6 +228,9 @@ def run(args) -> None:
         for _, head_dict in args.heads.items():
             # priority is global args < head property_key values < head info_keys+arrays_keys
             head_keyspec = deepcopy(args.key_specification)
+            # Allow "property_name" as an alias for "property_key" in head dicts
+            if "property_name" in head_dict and "property_key" not in head_dict:
+                head_dict["property_key"] = head_dict["property_name"]
             update_keyspec_from_kwargs(head_keyspec, head_dict)
             head_keyspec.update(
                 info_keys=head_dict.get("info_keys", {}),
@@ -340,9 +344,12 @@ def run(args) -> None:
                 head_name=head_config.head_name,
                 keep_isolated_atoms=head_config.keep_isolated_atoms,
                 no_data_ok=(
-                    args.pseudolabel_replay
-                    and args.multiheads_finetuning
-                    and head_config.head_name == "pt_head"
+                    (
+                        args.pseudolabel_replay
+                        and args.multiheads_finetuning
+                        and head_config.head_name == "pt_head"
+                    )
+                    or head_config.property_name is not None  # any property head (task_dim may be auto-set)
                 ),
                 prefix=args.name,
             )
@@ -748,11 +755,179 @@ def run(args) -> None:
             generator=torch.Generator().manual_seed(args.seed),
         )
 
-    loss_fn = get_loss_fn(args, dipole_only, args.compute_dipole)
-    args.avg_num_neighbors = get_avg_num_neighbors(head_configs, args, train_loader, device)
+    # Identify property heads (those with task_dim set) and energy heads.
+    # Done here (before avg_num_neighbors and configure_model) so we can pass a
+    # pure-energy loader to those calls in multi-task mode and avoid PyG batching
+    # failures that occur when energy samples (property_label=None) and property
+    # samples (property_label=tensor) are mixed in the combined train_loader.
+    property_head_configs = [hc for hc in head_configs if hc.task_dim is not None or hc.property_name is not None]
+    energy_head_configs = [hc for hc in head_configs if hc.task_dim is None and hc.property_name is None]
+
+    # Loader to pass to setup calls (avg_num_neighbors, configure_model).
+    # In multi-task mode use only energy-head data to avoid the mixed-label batching issue.
+    setup_loader = (
+        energy_head_configs[0].train_loader
+        if (args.model == "ScaleShiftMACEProperty" and property_head_configs and energy_head_configs)
+        else train_loader
+    )
+
+    # Energy heads share the same cutoff/domain as the foundation model, so inherit
+    # avg_num_neighbors from it rather than re-scanning the training data.
+    # Property heads may use different data, so they compute their own value.
+    if foundation_model_avg_num_neighbors > 0:
+        for hc in energy_head_configs:
+            if hc.compute_avg_num_neighbors:
+                hc.avg_num_neighbors = foundation_model_avg_num_neighbors
+                hc.compute_avg_num_neighbors = False
+
+    # In MFT, override all heads to use property data's avg_num_neighbors.
+    # avg_num_neighbors is a single global backbone constant, so one value must be
+    # chosen for all batches. Empirically, property data's value gives better
+    # property convergence than the foundation model's value.
+    if foundation_model_avg_num_neighbors > 0 and property_head_configs and energy_head_configs:
+        property_avg_loader = torch_geometric.dataloader.DataLoader(
+            dataset=property_head_configs[0].train_loader.dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=args.pin_memory,
+            num_workers=args.num_workers,
+        )
+        property_avg_num_neighbors = compute_avg_num_neighbors(property_avg_loader)
+        for hc in head_configs:
+            hc.avg_num_neighbors = property_avg_num_neighbors
+            hc.compute_avg_num_neighbors = False
+
+    args.avg_num_neighbors = get_avg_num_neighbors(head_configs, args, setup_loader, device)
+
+    # For ScaleShiftMACEProperty with both energy and property heads, use separate
+    # dataloaders: property loader drives the epoch, energy loader cycles as regularizer.
+    multitask_property_loader = None
+    multitask_energy_loader = None
+    if (
+        args.model == "ScaleShiftMACEProperty"
+        and property_head_configs
+        and energy_head_configs
+    ):
+        multitask_property_loader = property_head_configs[0].train_loader
+        energy_bs = getattr(args, "energy_batch_size", None) or args.batch_size
+        energy_hc = energy_head_configs[0]
+        multitask_energy_loader = torch_geometric.dataloader.DataLoader(
+            dataset=train_sets[energy_hc.head_name],
+            batch_size=energy_bs,
+            shuffle=True,
+            drop_last=(not args.lbfgs),
+            pin_memory=args.pin_memory,
+            num_workers=args.num_workers,
+            generator=torch.Generator().manual_seed(args.seed),
+        )
+        logging.info(
+            "Multi-task training: property loader (primary, batch_size=%d) + "
+            "energy loader (regularizer, batch_size=%d, energy_reg_weight=%s)",
+            args.batch_size,
+            energy_bs,
+            args.energy_reg_weight,
+        )
+        # Remove energy head(s) from valid_loaders: their validation is slow
+        # (large dataset) and irrelevant — only property validation drives
+        # early stopping, LR scheduling, and checkpointing.
+        for ehc in energy_head_configs:
+            valid_loaders.pop(ehc.head_name, None)
+
+        # Only the WeightedEnergyForcesProperty losses handle both batch types safely:
+        #   - property batch (no energy/forces) → computes property loss only
+        #   - energy batch (no property_label) → computes energy/forces loss only
+        # Any other loss will either crash on property batches that lack energy/force
+        # labels, or return 0 on energy batches and provide no regularization.
+        if args.loss not in ("energy_forces_property", "energy_forces_property_huber"):
+            logging.warning(
+                "Multi-task training: --loss %s is not supported. "
+                "Use --loss energy_forces_property (or energy_forces_property_huber), "
+                "which safely handle property batches (no energy labels) and energy "
+                "batches (no property_label).",
+                args.loss,
+            )
+
+    # Auto-set error table for property training losses
+    if args.model == "ScaleShiftMACEProperty" and property_head_configs:
+        if args.loss in ("property", "property_huber", "energy_forces_property", "energy_forces_property_huber"):
+            args.error_table = "PropertyRMSE"
+
+    # Compute per-head label mean/std from training data for property normalization
+    property_mean: Dict[str, torch.Tensor] = {}
+    property_std: Dict[str, torch.Tensor] = {}
+    if args.model == "ScaleShiftMACEProperty" and property_head_configs:
+        for hc in property_head_configs:
+            labels = []
+            # Compute normalization from the full property dataset. The training
+            # loader is shuffled and may drop the last partial batch, which makes
+            # the mean/std depend on loader RNG state and can differ between FT
+            # and MFT runs using the same property file.
+            property_norm_loader = torch_geometric.dataloader.DataLoader(
+                dataset=hc.train_loader.dataset,
+                batch_size=args.batch_size,
+                shuffle=False,
+                drop_last=False,
+                pin_memory=args.pin_memory,
+                num_workers=args.num_workers,
+            )
+            for batch in property_norm_loader:
+                if batch.property_label is not None:
+                    if hc.property_intensive:
+                        labels.append(batch.property_label)
+                    else:
+                        natoms = (batch.ptr[1:] - batch.ptr[:-1]).float().unsqueeze(-1)
+                        labels.append(batch.property_label / natoms)
+            if labels:
+                all_labels = torch.cat(labels, dim=0).float()
+                mean_val = all_labels.mean(dim=0)
+                std_val = all_labels.std(dim=0)
+                std_val = torch.where(std_val < 1e-8, torch.ones_like(std_val), std_val)
+                property_mean[hc.head_name] = mean_val.to(torch.get_default_dtype())
+                if (hc.property_aggregation or "default") != "r2":
+                    property_std[hc.head_name] = std_val.to(torch.get_default_dtype())
+                logging.info(
+                    f"Property normalization for head '{hc.head_name}': "
+                    f"mean={mean_val.tolist()}, std={std_val.tolist()}"
+                )
+
+    # Single std tensor and intensive flag for the loss (one property per run)
+    loss_property_std = next(iter(property_std.values())) if property_std else None
+    loss_property_intensive = (
+        property_head_configs[0].property_intensive
+        if property_head_configs and property_head_configs[0].property_intensive is not None
+        else True
+    )
+    loss_fn = get_loss_fn(
+        args, dipole_only, args.compute_dipole,
+        property_std=loss_property_std,
+        property_intensive=loss_property_intensive,
+    )
 
     # Model
-    model, output_args = configure_model(args, train_loader, atomic_energies, model_foundation, heads, z_table, head_configs)
+    model, output_args = configure_model(
+        args,
+        setup_loader,
+        atomic_energies,
+        model_foundation,
+        heads,
+        z_table,
+        head_configs,
+        property_head_configs=property_head_configs if property_head_configs else None,
+        property_mean=property_mean if property_mean else None,
+        property_std=property_std if property_std else None,
+    )
+    # Property-only mode: no energy head means forces/virials/stress are never
+    # used in any loss — disable them to avoid the expensive autograd call
+    # (create_graph=True) that build_forces requires during training.
+    if args.model == "ScaleShiftMACEProperty" and property_head_configs and not energy_head_configs:
+        output_args["forces"] = False
+        output_args["virials"] = False
+        output_args["stress"] = False
+        logging.info(
+            "ScaleShiftMACEProperty property-only mode: "
+            "disabling force/virial/stress computation (no energy head present)"
+        )
     model.to(device)
 
     if args.lora:
@@ -816,6 +991,17 @@ def run(args) -> None:
 
     # Optimizer
     param_options = get_params_options(args, model)
+
+    l2sp_reference_params = None
+    if getattr(args, "l2sp_delta", 0.0) > 0:
+        if model_foundation is None:
+            raise ValueError("--l2sp_delta requires --foundation_model")
+        l2sp_reference_params = tools.build_l2sp_reference_params(
+            model=model,
+            foundation_model=model_foundation,
+            device=device,
+        )
+        logging.info("L2-SP delta: %s", args.l2sp_delta)
 
     optimizer: torch.optim.Optimizer
     optimizer = get_optimizer(args, param_options)
@@ -899,7 +1085,10 @@ def run(args) -> None:
 
 
     train_valid_data_loader = {}
+    _energy_head_names_plotter = {hc.head_name for hc in energy_head_configs} if multitask_energy_loader else set()
     for head_config in head_configs:
+        if head_config.head_name in _energy_head_names_plotter:
+            continue
         data_loader_name = "train_" + head_config.head_name
         train_valid_data_loader[data_loader_name] = head_config.train_loader
     for head, valid_loader in valid_loaders.items():
@@ -942,7 +1131,7 @@ def run(args) -> None:
     tools.train(
         model=model,
         loss_fn=loss_fn,
-        train_loader=train_loader,
+        train_loader=multitask_energy_loader if multitask_energy_loader else train_loader,
         valid_loaders=valid_loaders,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
@@ -953,6 +1142,7 @@ def run(args) -> None:
         logger=logger,
         patience=args.patience,
         save_all_checkpoints=args.save_all_checkpoints,
+        checkpoint_interval=args.checkpoint_interval,
         output_args=output_args,
         device=device,
         swa=swa,
@@ -965,18 +1155,29 @@ def run(args) -> None:
         plotter=plotter,
         train_sampler=train_sampler,
         rank=rank,
+        property_loader=multitask_property_loader,
+        energy_reg_weight=getattr(args, "energy_reg_weight", 1.0),
+        l2sp_reference_params=l2sp_reference_params,
+        l2sp_delta=getattr(args, "l2sp_delta", 0.0),
     )
 
     logging.info("")
     logging.info("===========RESULTS===========")
 
     train_valid_data_loader = {}
-    for head_config in head_configs:
-        data_loader_name = "train_" + head_config.head_name
-        train_valid_data_loader[data_loader_name] = head_config.train_loader
-    for head, valid_loader in valid_loaders.items():
-        data_load_name = "valid_" + head
-        train_valid_data_loader[data_load_name] = valid_loader
+    energy_head_names = {hc.head_name for hc in energy_head_configs} if multitask_energy_loader else set()
+    if not args.skip_train_eval:
+        for head_config in head_configs:
+            if head_config.head_name in energy_head_names:
+                continue  # skip energy head — large dataset, not relevant to property accuracy
+            data_loader_name = "train_" + head_config.head_name
+            train_valid_data_loader[data_loader_name] = head_config.train_loader
+    if not args.skip_valid_eval:
+        for head, valid_loader in valid_loaders.items():
+            if head in energy_head_names:
+                continue
+            data_load_name = "valid_" + head
+            train_valid_data_loader[data_load_name] = valid_loader
     test_sets = {}
     stop_first_test = False
     test_data_loader = {}
